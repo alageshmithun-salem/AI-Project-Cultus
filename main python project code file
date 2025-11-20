@@ -1,0 +1,489 @@
+"""
+time_series_forecasting_full.py
+
+Comprehensive single-file project that includes:
+- Synthetic multivariate time series generation (trend + multiple seasonalities + noise)
+- Data preprocessing and normalization
+- PyTorch Dataset/DataLoader for sliding-window sequences
+- Two model choices: Transformer encoder and BiLSTM + Self-Attention
+- Training loop with logging, model checkpointing, and evaluation (RMSE, MAE)
+- Optuna hyperparameter tuning (search over learning rate, model dims, dropout, etc.)
+- Rolling-window cross-validation and final test evaluation
+- Artifact export: trained model state_dict, Optuna study, and a Markdown report summarizing results
+- Optional plotting utilities to save diagnostic figures (requires matplotlib)
+
+Usage:
+- Install dependencies: `pip install torch optuna numpy pandas matplotlib scikit-learn`
+- Run: `python time_series_forecasting_full.py`
+- Configure parameters in the `CONFIG` dict near the top.
+
+Author: ChatGPT (GPT-5 Thinking mini)
+"""
+
+import os
+import math
+import random
+import json
+from datetime import datetime
+from typing import Tuple, Dict, Any
+
+import numpy as np
+import pandas as pd
+
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except Exception:
+    OPTUNA_AVAILABLE = False
+
+# Optional plotting
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    PLOTTING_AVAILABLE = True
+except Exception:
+    PLOTTING_AVAILABLE = False
+
+# -----------------------------
+# Configuration
+# -----------------------------
+CONFIG = {
+    'seed': 42,
+    'n_timesteps': 4000,
+    'n_series': 4,
+    'in_size': 96,
+    'out_size': 24,
+    'target_dim': 0,
+    'batch_size': 128,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'optuna_trials': 40,
+    'results_dir': 'results',
+    'use_optuna': True,
+}
+
+os.makedirs(CONFIG['results_dir'], exist_ok=True)
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(CONFIG['seed'])
+
+# -----------------------------
+# Synthetic data generation
+# -----------------------------
+
+def generate_synthetic_multivariate_series(n_timesteps: int = 4000,
+                                           n_series: int = 3,
+                                           seed: int = 42) -> pd.DataFrame:
+    """Generates a DataFrame with shape (n_timesteps, n_series) and a datetime index.
+    Columns named series_0, series_1, ...
+    """
+    np.random.seed(seed)
+    t = np.arange(n_timesteps)
+    data = {}
+    for i in range(n_series):
+        trend = 0.0004 * t * (1 + 0.15 * i)
+        seasonal1 = 3.0 * np.sin(2 * np.pi * t / (24 + i))
+        seasonal2 = 0.7 * np.sin(2 * np.pi * t / (168 + 7 * i))
+        noise = 0.6 * np.random.randn(n_timesteps)
+        base = 20 + trend + seasonal1 + seasonal2 + noise + i * 0.5
+        data[f'series_{i}'] = base
+    idx = pd.date_range(start='2020-01-01', periods=n_timesteps, freq='H')
+    df = pd.DataFrame(data, index=idx)
+    return df
+
+
+# -----------------------------
+# Dataset
+# -----------------------------
+class SlidingWindowDataset(Dataset):
+    def __init__(self, data: np.ndarray, in_size: int = 96, out_size: int = 24, target_dim: int = 0):
+        assert data.ndim == 2
+        self.data = data.astype(np.float32)
+        self.in_size = in_size
+        self.out_size = out_size
+        self.target_dim = target_dim
+        self.n_steps = data.shape[0]
+
+    def __len__(self):
+        return max(0, self.n_steps - self.in_size - self.out_size + 1)
+
+    def __getitem__(self, idx):
+        x = self.data[idx: idx + self.in_size]  # (in_size, n_series)
+        y = self.data[idx + self.in_size: idx + self.in_size + self.out_size, self.target_dim]
+        return x, y
+
+
+def collate_batch(batch):
+    xs, ys = zip(*batch)
+    xs = torch.tensor(np.stack(xs, axis=0))  # (B, in_size, n_series)
+    ys = torch.tensor(np.stack(ys, axis=0))  # (B, out_size)
+    ys = ys.unsqueeze(-1)  # (B, out_size, 1)
+    return xs, ys
+
+
+# -----------------------------
+# Models
+# -----------------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() *
+                             -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len]
+
+
+class TransformerForecastingModel(nn.Module):
+    def __init__(self, input_dim: int, d_model: int = 64, nhead: int = 4,
+                 num_layers: int = 2, dim_feedforward: int = 128,
+                 dropout: float = 0.1, out_size: int = 24):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_enc = PositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
+                                                   dim_feedforward=dim_feedforward,
+                                                   dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, out_size)
+        )
+        self.out_size = out_size
+
+    def forward(self, x):
+        h = self.input_proj(x)
+        h = self.pos_enc(h)
+        h = self.encoder(h)
+        h = h.mean(dim=1)
+        out = self.head(h)
+        out = out.unsqueeze(-1)  # (B, out_size, 1)
+        return out
+
+
+class SelfAttentionPooling(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.query = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        scores = self.query(x)
+        weights = torch.softmax(scores, dim=1)
+        pooled = (weights * x).sum(dim=1)
+        return pooled, weights.squeeze(-1)
+
+
+class BiLSTMAttentionModel(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int = 64, num_layers: int = 2,
+                 out_size: int = 24, dropout: float = 0.1):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers,
+                            batch_first=True, bidirectional=True, dropout=dropout)
+        self.attn_pool = SelfAttentionPooling(input_dim=hidden_dim * 2)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, out_size)
+        )
+        self.out_size = out_size
+
+    def forward(self, x):
+        h, _ = self.lstm(x)
+        pooled, attn_weights = self.attn_pool(h)
+        out = self.head(pooled)
+        out = out.unsqueeze(-1)
+        return out, attn_weights
+
+
+# -----------------------------
+# Training and evaluation
+# -----------------------------
+
+def loss_fn(pred, target):
+    return nn.MSELoss()(pred, target)
+
+
+def evaluate_model(model, dataloader, device, model_type: str = 'transformer') -> Dict[str, float]:
+    model.eval()
+    mse_loss = nn.MSELoss(reduction='sum')
+    mae_loss = nn.L1Loss(reduction='sum')
+    total_mse = 0.0
+    total_mae = 0.0
+    total_count = 0
+    with torch.no_grad():
+        for xb, yb in dataloader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            if model_type == 'transformer':
+                preds = model(xb)
+            else:
+                preds, _ = model(xb)
+            total_mse += mse_loss(preds, yb).item()
+            total_mae += mae_loss(preds, yb).item()
+            total_count += np.prod(yb.shape)
+    rmse = math.sqrt(total_mse / total_count)
+    mae = total_mae / total_count
+    return {'RMSE': rmse, 'MAE': mae}
+
+
+def train_one_epoch(model, optimizer, dataloader, device, model_type: str = 'transformer'):
+    model.train()
+    running_loss = 0.0
+    for xb, yb in dataloader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        optimizer.zero_grad()
+        if model_type == 'transformer':
+            preds = model(xb)
+        else:
+            preds, _ = model(xb)
+        loss = loss_fn(preds, yb)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+        running_loss += loss.item() * xb.size(0)
+    return running_loss / len(dataloader.dataset)
+
+
+# -----------------------------
+# Cross-validation and experiment flow
+# -----------------------------
+
+def prepare_dataloaders(series_np: np.ndarray, train_end_idx: int, val_end_idx: int,
+                        in_size: int, out_size: int, batch_size: int):
+    train_data = series_np[:train_end_idx]
+    val_data = series_np[train_end_idx:val_end_idx + in_size + out_size]
+    test_data = series_np[val_end_idx:]
+
+    train_ds = SlidingWindowDataset(train_data, in_size=in_size, out_size=out_size, target_dim=CONFIG['target_dim'])
+    val_ds = SlidingWindowDataset(val_data, in_size=in_size, out_size=out_size, target_dim=CONFIG['target_dim'])
+    test_ds = SlidingWindowDataset(test_data, in_size=in_size, out_size=out_size, target_dim=CONFIG['target_dim'])
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
+
+    return train_loader, val_loader, test_loader
+
+
+def run_training(model, train_loader, val_loader, device, epochs: int = 20, lr: float = 1e-3,
+                 model_type: str = 'transformer') -> Tuple[Any, Dict[str, float]]:
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    best_rmse = float('inf')
+    best_state = None
+    for epoch in range(epochs):
+        train_loss = train_one_epoch(model, optimizer, train_loader, device, model_type)
+        val_metrics = evaluate_model(model, val_loader, device, model_type)
+        print(f"Epoch {epoch+1}/{epochs} train_loss: {train_loss:.4f} val_rmse: {val_metrics['RMSE']:.4f} val_mae: {val_metrics['MAE']:.4f}")
+        if val_metrics['RMSE'] < best_rmse:
+            best_rmse = val_metrics['RMSE']
+            best_state = model.state_dict()
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {'val_rmse': best_rmse}
+
+
+# -----------------------------
+# Optuna objective
+# -----------------------------
+
+def objective_optuna(trial, series_np, train_end_idx, val_end_idx, config):
+    # Search space
+    model_type = trial.suggest_categorical('model_type', ['transformer', 'bilstm'])
+    lr = trial.suggest_loguniform('lr', 1e-5, 1e-2)
+    dropout = trial.suggest_float('dropout', 0.0, 0.4)
+    if model_type == 'transformer':
+        d_model = trial.suggest_categorical('d_model', [32, 64, 96])
+        nhead = trial.suggest_categorical('nhead', [2, 4, 8])
+        num_layers = trial.suggest_int('num_layers', 1, 3)
+        model = TransformerForecastingModel(input_dim=config['n_series'], d_model=d_model, nhead=nhead,
+                                            num_layers=num_layers, dim_feedforward=d_model * 4,
+                                            dropout=dropout, out_size=config['out_size'])
+    else:
+        hidden_dim = trial.suggest_categorical('hidden_dim', [32, 64, 96])
+        num_layers = trial.suggest_int('num_layers', 1, 3)
+        model = BiLSTMAttentionModel(input_dim=config['n_series'], hidden_dim=hidden_dim,
+                                     num_layers=num_layers, out_size=config['out_size'], dropout=dropout)
+
+    train_loader, val_loader, _ = prepare_dataloaders(series_np, train_end_idx, val_end_idx,
+                                                      config['in_size'], config['out_size'], config['batch_size'])
+    model.to(config['device'])
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    best_val_rmse = float('inf')
+    for epoch in range(10):  # small number for trials
+        train_one_epoch(model, optimizer, train_loader, config['device'], model_type=('transformer' if model_type == 'transformer' else 'bilstm'))
+        val_metrics = evaluate_model(model, val_loader, config['device'], model_type=('transformer' if model_type == 'transformer' else 'bilstm'))
+        if val_metrics['RMSE'] < best_val_rmse:
+            best_val_rmse = val_metrics['RMSE']
+
+    trial.report(best_val_rmse, step=0)
+    return best_val_rmse
+
+
+# -----------------------------
+# Experiment orchestration
+# -----------------------------
+
+def run_experiment(df: pd.DataFrame, config: Dict[str, Any]):
+    # Preprocess: z-score per series
+    series_np = df.values.astype(np.float32)
+    mu = series_np.mean(axis=0, keepdims=True)
+    sigma = series_np.std(axis=0, keepdims=True) + 1e-6
+    series_np = (series_np - mu) / sigma
+
+    n = series_np.shape[0]
+    # Split indexes (train / val / test) by time
+    train_end_idx = int(n * 0.6)
+    val_end_idx = int(n * 0.8)
+
+    # If Optuna requested
+    study = None
+    best_params = None
+    if config['use_optuna'] and OPTUNA_AVAILABLE:
+        def optuna_obj(trial):
+            return objective_optuna(trial, series_np, train_end_idx, val_end_idx, config)
+        study = optuna.create_study(direction='minimize')
+        study.optimize(optuna_obj, n_trials=config['optuna_trials'], show_progress_bar=True)
+        best_params = study.best_trial.params
+        print('Best Optuna params:', best_params)
+        # Save study
+        optuna_path = os.path.join(config['results_dir'], 'optuna_study.pkl')
+        try:
+            joblib = None
+            import joblib
+            joblib.dump(study, optuna_path)
+        except Exception:
+            with open(os.path.join(config['results_dir'], 'optuna_best_params.json'), 'w') as f:
+                json.dump(best_params, f, indent=2)
+
+    # Build a final model using best params or defaults
+    if best_params is None:
+        # defaults
+        model_choice = 'transformer'
+        model = TransformerForecastingModel(input_dim=config['n_series'], d_model=64, nhead=4,
+                                           num_layers=2, dim_feedforward=256, dropout=0.1, out_size=config['out_size'])
+        lr = 1e-3
+    else:
+        model_choice = best_params.get('model_type', 'transformer')
+        lr = float(best_params.get('lr', 1e-3))
+        if model_choice == 'transformer':
+            d_model = int(best_params.get('d_model', 64))
+            nhead = int(best_params.get('nhead', 4))
+            num_layers = int(best_params.get('num_layers', 2))
+            dropout = float(best_params.get('dropout', 0.1))
+            model = TransformerForecastingModel(input_dim=config['n_series'], d_model=d_model, nhead=nhead,
+                                               num_layers=num_layers, dim_feedforward=d_model * 4, dropout=dropout, out_size=config['out_size'])
+        else:
+            hidden_dim = int(best_params.get('hidden_dim', 64))
+            num_layers = int(best_params.get('num_layers', 2))
+            dropout = float(best_params.get('dropout', 0.1))
+            model = BiLSTMAttentionModel(input_dim=config['n_series'], hidden_dim=hidden_dim, num_layers=num_layers, out_size=config['out_size'], dropout=dropout)
+
+    train_loader, val_loader, test_loader = prepare_dataloaders(series_np, train_end_idx, val_end_idx, config['in_size'], config['out_size'], config['batch_size'])
+
+    model_type_label = 'transformer' if isinstance(model, TransformerForecastingModel) else 'bilstm'
+
+    model, _ = run_training(model, train_loader, val_loader, config['device'], epochs=30, lr=lr, model_type=model_type_label)
+
+    test_metrics = evaluate_model(model, test_loader, config['device'], model_type=model_type_label)
+    print('Final test metrics:', test_metrics)
+
+    # Save model
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    model_path = os.path.join(config['results_dir'], f'model_{model_type_label}_{timestamp}.pt')
+    torch.save({'model_state_dict': model.state_dict(), 'config': config}, model_path)
+
+    # Save a small report
+    report = {
+        'timestamp': timestamp,
+        'model_type': model_type_label,
+        'test_metrics': test_metrics,
+        'optuna_best_params': best_params
+    }
+    report_path = os.path.join(config['results_dir'], f'report_{timestamp}.json')
+    with open(report_path, 'w') as f:
+        json.dump(report, f, indent=2)
+
+    if PLOTTING_AVAILABLE:
+        # plot a random test sample prediction vs ground truth
+        model.eval()
+        xb, yb = next(iter(test_loader))
+        xb = xb.to(config['device'])
+        with torch.no_grad():
+            if model_type_label == 'transformer':
+                preds = model(xb)
+            else:
+                preds, attn = model(xb)
+        preds = preds.cpu().numpy()
+        yb = yb.numpy()
+        # plot first sample
+        plt.figure(figsize=(8, 3))
+        plt.plot(range(config['in_size'], config['in_size'] + config['out_size']), yb[0, :, 0], label='true')
+        plt.plot(range(config['in_size'], config['in_size'] + config['out_size']), preds[0, :, 0], label='pred')
+        plt.legend()
+        plt.title('Prediction vs True (one sample)')
+        figpath = os.path.join(config['results_dir'], f'prediction_{timestamp}.png')
+        plt.savefig(figpath)
+
+    # Write a human-readable markdown report
+    md_lines = [
+        f"# Time Series Forecasting Experiment ({timestamp})\n",
+        f"- Model type: **{model_type_label}**\n",
+        f"- Test RMSE: **{test_metrics['RMSE']:.4f}**, Test MAE: **{test_metrics['MAE']:.4f}**\n",
+        f"- Optuna best params: `{best_params}`\n",
+        '\n',
+        '## Notes\n',
+        '- Data: synthetic multivariate series with trend and multiple seasonality components.\n',
+        '- Preprocessing: per-series z-score normalization.\n',
+        '- Model training: early stopping by validation RMSE (simple selection).\n',
+        '\n',
+        '## Artifacts\n',
+        f'- Model saved: `{model_path}`\n',
+        f'- JSON report: `{report_path}`\n',
+    ]
+    md_path = os.path.join(config['results_dir'], f'report_{timestamp}.md')
+    with open(md_path, 'w') as f:
+        f.writelines('\n'.join(md_lines))
+
+    return report
+
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__ == '__main__':
+    print('Device:', CONFIG['device'])
+    df = generate_synthetic_multivariate_series(n_timesteps=CONFIG['n_timesteps'], n_series=CONFIG['n_series'], seed=CONFIG['seed'])
+    df.to_csv(os.path.join(CONFIG['results_dir'], 'synthetic_series.csv'))
+    report = run_experiment(df, CONFIG)
+    print('Experiment finished. Report saved in', CONFIG['results_dir'])
+
+    if not OPTUNA_AVAILABLE and CONFIG['use_optuna']:
+        print('\nNote: Optuna is not installed. To enable hyperparameter tuning, install optuna: pip install optuna')
+
+    if not PLOTTING_AVAILABLE:
+        print('Note: matplotlib not available, plots not generated.')
+
+    print('\nDone.')
